@@ -242,6 +242,25 @@ EOF
     sudo systemctl daemon-reload
     sudo systemctl enable --now nqptp
     sudo systemctl enable --now shairport-sync
+
+    # Udev hotplug hook to re-detect output on HDMI / sound card changes
+    sudo tee /usr/local/bin/shairport-udev-restart >/dev/null <<'EOF'
+#!/bin/sh
+/usr/bin/systemctl try-restart shairport-sync.service
+EOF
+    sudo chmod 755 /usr/local/bin/shairport-udev-restart
+
+    sudo tee /etc/udev/rules.d/99-shairport-hotplug.rules >/dev/null <<'EOF'
+# Restart Shairport when displays are connected/disconnected (HDMI hotplug)
+ACTION=="change", SUBSYSTEM=="drm", ENV{HOTPLUG}=="1", RUN+="/usr/local/bin/shairport-udev-restart"
+# Restart Shairport when ALSA cards change (USB DACs, etc.)
+ACTION=="change", SUBSYSTEM=="sound", KERNEL=="card*", RUN+="/usr/local/bin/shairport-udev-restart"
+EOF
+
+    sudo udevadm control --reload
+    # Optional: prime current state so we pick initial device when headless
+    sudo udevadm trigger --subsystem-match=drm --action=change || true
+    sudo udevadm trigger --subsystem-match=sound --action=change || true
 }
 
 install_raspotify() {
