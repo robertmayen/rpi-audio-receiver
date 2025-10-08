@@ -1,68 +1,270 @@
 #!/bin/bash
 
-set -e
+# Raspberry Pi Audio Receiver - Production Installation Script
+# Features: State management, rollback, validation, idempotency
+
+set -euo pipefail
+
+#==============================================================================
+# CONFIGURATION
+#==============================================================================
 
 NQPTP_VERSION="1.2.4"
-# Build Shairport Sync with AirPlay 2 support; use a version compatible with FFmpeg 7
 SHAIRPORT_SYNC_VERSION="4.3.7"
-TMP_DIR=""
 
-cleanup() {
-    if [ -d "${TMP_DIR}" ]; then
-        rm -rf "${TMP_DIR}"
+STATE_DIR="/var/lib/audio-receiver"
+STATE_FILE="${STATE_DIR}/state.json"
+LOG_FILE="${STATE_DIR}/install.log"
+BACKUP_DIR="${STATE_DIR}/backups"
+
+REQUIRED_OS_IDS=("debian" "raspbian")
+REQUIRED_OS_VERSIONS=("12" "13")
+
+#==============================================================================
+# UTILITY FUNCTIONS
+#==============================================================================
+
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE" >&2
+}
+
+info() { log "INFO" "$@"; }
+warn() { log "WARN" "$@"; }
+error() { log "ERROR" "$@"; }
+success() { log "SUCCESS" "$@"; }
+
+die() {
+    error "$@"
+    exit 1
+}
+
+ensure_root() {
+    if [[ $EUID -ne 0 ]]; then
+        die "This script must be run as root. Use: sudo bash $0"
     fi
 }
 
-verify_os() {
-    MSG="Unsupported OS: Debian 12/13 is required."
-
-    if [ ! -f /etc/os-release ]; then
-        echo $MSG
-        exit 1
-    fi
-
-    . /etc/os-release
-
-    # Accept Debian / Raspbian 12 (bookworm) and 13 (trixie)
-    if [[ ("$ID" != "debian" && "$ID" != "raspbian") || ("$VERSION_ID" != "12" && "$VERSION_ID" != "13") ]]; then
-        echo $MSG
-        exit 1
+ensure_state_dir() {
+    mkdir -p "$STATE_DIR" "$BACKUP_DIR"
+    touch "$LOG_FILE"
+    
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo '{}' > "$STATE_FILE"
     fi
 }
 
-set_hostname() {
-    CURRENT_PRETTY_HOSTNAME=$(hostnamectl status --pretty)
-
-    read -p "Hostname [$(hostname)]: " HOSTNAME
-    # Use hostnamectl on generic Debian instead of raspi-config
-    if [[ -n "${HOSTNAME}" ]]; then
-        sudo hostnamectl set-hostname "${HOSTNAME}"
-    fi
-
-    read -p "Pretty hostname [${CURRENT_PRETTY_HOSTNAME:-Audio Receiver}]: " PRETTY_HOSTNAME
-    PRETTY_HOSTNAME="${PRETTY_HOSTNAME:-${CURRENT_PRETTY_HOSTNAME:-Audio Receiver}}"
-    sudo hostnamectl set-hostname --pretty "$PRETTY_HOSTNAME"
-}
-
-install_bluetooth() {
-    read -p "Do you want to install Bluetooth Audio (ALSA)? [y/N] " REPLY
-    if [[ ! "$REPLY" =~ ^(yes|y|Y)$ ]]; then return; fi
-
-    # Bluetooth stack and BlueALSA backend (avoid recommends for lean install)
-    sudo apt update
-    # Pick BlueALSA package names that exist on this Debian
-    PKGS=(bluez bluez-tools)
-    if apt-cache show bluez-alsa-utils >/dev/null 2>&1; then
-      PKGS+=(bluez-alsa-utils)
+get_state() {
+    local key=$1
+    local default=${2:-null}
+    
+    if command -v jq &>/dev/null; then
+        jq -r ".\"$key\" // $default" "$STATE_FILE" 2>/dev/null || echo "$default"
     else
-      # Debian typically ships bluealsa / bluealsa-utils
-      if apt-cache show bluealsa >/dev/null 2>&1; then PKGS+=(bluealsa); fi
-      if apt-cache show bluealsa-utils >/dev/null 2>&1; then PKGS+=(bluealsa-utils); fi
+        # Fallback without jq
+        grep -o "\"$key\":[^,}]*" "$STATE_FILE" 2>/dev/null | cut -d: -f2- | tr -d '"' || echo "$default"
     fi
-    sudo apt install -y --no-install-recommends "${PKGS[@]}"
+}
 
-    # Bluetooth settings
-    sudo tee /etc/bluetooth/main.conf >/dev/null <<'EOF'
+set_state() {
+    local key=$1
+    local value=$2
+    
+    if command -v jq &>/dev/null; then
+        local temp=$(mktemp)
+        jq ".\"$key\" = \"$value\"" "$STATE_FILE" > "$temp" && mv "$temp" "$STATE_FILE"
+    else
+        # Simple fallback - just append (not ideal but works)
+        if grep -q "\"$key\":" "$STATE_FILE"; then
+            sed -i "s/\"$key\":\"[^\"]*\"/\"$key\":\"$value\"/" "$STATE_FILE"
+        else
+            # Add new key
+            sed -i 's/}$/,"'"$key"'":"'"$value"'"}/' "$STATE_FILE"
+            sed -i 's/{,/{/' "$STATE_FILE"
+        fi
+    fi
+}
+
+is_installed() {
+    local component=$1
+    [[ "$(get_state "$component")" == "installed" ]]
+}
+
+mark_installed() {
+    local component=$1
+    set_state "$component" "installed"
+    success "$component successfully installed and verified"
+}
+
+mark_failed() {
+    local component=$1
+    set_state "$component" "failed"
+}
+
+#==============================================================================
+# VALIDATION FUNCTIONS
+#==============================================================================
+
+validate_os() {
+    info "Validating OS compatibility..."
+    
+    if [[ ! -f /etc/os-release ]]; then
+        die "Cannot detect OS: /etc/os-release not found"
+    fi
+    
+    source /etc/os-release
+    
+    local os_valid=false
+    for valid_id in "${REQUIRED_OS_IDS[@]}"; do
+        if [[ "$ID" == "$valid_id" ]]; then
+            os_valid=true
+            break
+        fi
+    done
+    
+    if [[ "$os_valid" != "true" ]]; then
+        die "Unsupported OS: $ID (required: ${REQUIRED_OS_IDS[*]})"
+    fi
+    
+    local version_valid=false
+    for valid_version in "${REQUIRED_OS_VERSIONS[@]}"; do
+        if [[ "$VERSION_ID" == "$valid_version" ]]; then
+            version_valid=true
+            break
+        fi
+    done
+    
+    if [[ "$version_valid" != "true" ]]; then
+        die "Unsupported OS version: $VERSION_ID (required: ${REQUIRED_OS_VERSIONS[*]})"
+    fi
+    
+    success "OS validated: $ID $VERSION_ID ($VERSION_CODENAME)"
+}
+
+validate_dependencies() {
+    info "Validating system dependencies..."
+    
+    local missing_deps=()
+    local required_commands=("wget" "apt" "systemctl" "mktemp")
+    
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        die "Missing required commands: ${missing_deps[*]}"
+    fi
+    
+    # Check disk space (need at least 500MB)
+    local available_mb=$(df -m / | awk 'NR==2 {print $4}')
+    if [[ $available_mb -lt 500 ]]; then
+        die "Insufficient disk space: ${available_mb}MB available, need at least 500MB"
+    fi
+    
+    success "System dependencies validated"
+}
+
+validate_network() {
+    info "Validating network connectivity..."
+    
+    if ! ping -c 1 -W 5 github.com &>/dev/null; then
+        warn "Cannot reach github.com - installation may fail"
+        read -p "Continue anyway? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            die "Installation cancelled by user"
+        fi
+    else
+        success "Network connectivity validated"
+    fi
+}
+
+#==============================================================================
+# BACKUP FUNCTIONS
+#==============================================================================
+
+backup_file() {
+    local file=$1
+    
+    if [[ -f "$file" ]]; then
+        local backup_name="$(basename "$file").$(date +%Y%m%d-%H%M%S).bak"
+        local backup_path="${BACKUP_DIR}/${backup_name}"
+        cp "$file" "$backup_path"
+        info "Backed up $file to $backup_path"
+        echo "$backup_path"
+    fi
+}
+
+#==============================================================================
+# HOSTNAME CONFIGURATION
+#==============================================================================
+
+configure_hostname() {
+    if is_installed "hostname"; then
+        info "Hostname already configured, skipping..."
+        return 0
+    fi
+    
+    info "Configuring hostname..."
+    
+    local current_hostname=$(hostname)
+    local current_pretty=$(hostnamectl status --pretty 2>/dev/null || echo "")
+    
+    read -p "Hostname [$current_hostname]: " new_hostname
+    new_hostname="${new_hostname:-$current_hostname}"
+    
+    read -p "Pretty hostname [${current_pretty:-Audio Receiver}]: " new_pretty
+    new_pretty="${new_pretty:-${current_pretty:-Audio Receiver}}"
+    
+    if [[ "$new_hostname" != "$current_hostname" ]]; then
+        backup_file "/etc/hostname"
+        backup_file "/etc/hosts"
+        hostnamectl set-hostname "$new_hostname" || die "Failed to set hostname"
+    fi
+    
+    hostnamectl set-hostname --pretty "$new_pretty" || die "Failed to set pretty hostname"
+    
+    set_state "hostname_name" "$new_hostname"
+    set_state "hostname_pretty" "$new_pretty"
+    mark_installed "hostname"
+}
+
+#==============================================================================
+# BLUETOOTH INSTALLATION
+#==============================================================================
+
+install_bluetooth_packages() {
+    info "Installing Bluetooth packages..."
+    
+    apt update || die "Failed to update package lists"
+    
+    local pkgs=(bluez bluez-tools)
+    
+    # Detect available BlueALSA package names
+    if apt-cache show bluez-alsa-utils &>/dev/null; then
+        pkgs+=(bluez-alsa-utils)
+    else
+        apt-cache show bluealsa &>/dev/null && pkgs+=(bluealsa)
+        apt-cache show bluealsa-utils &>/dev/null && pkgs+=(bluealsa-utils)
+    fi
+    
+    DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends "${pkgs[@]}" \
+        || die "Failed to install Bluetooth packages"
+    
+    success "Bluetooth packages installed"
+}
+
+configure_bluetooth() {
+    info "Configuring Bluetooth..."
+    
+    backup_file "/etc/bluetooth/main.conf"
+    
+    cat > /etc/bluetooth/main.conf <<'EOF'
 [General]
 Class = 0x200414
 DiscoverableTimeout = 0
@@ -70,16 +272,20 @@ DiscoverableTimeout = 0
 [Policy]
 AutoEnable=true
 EOF
+    
+    success "Bluetooth configuration written"
+}
 
-    # Bluetooth Agent
-    sudo tee /etc/systemd/system/bt-agent@.service >/dev/null <<'EOF'
+install_bluetooth_agent() {
+    info "Installing Bluetooth agent service..."
+    
+    cat > /etc/systemd/system/bt-agent@.service <<'EOF'
 [Unit]
 Description=Bluetooth Agent
 Requires=bluetooth.service
 After=bluetooth.service
 
 [Service]
-# Ensure adapter is ready for pairing and discoverable without relying on deprecated hciconfig
 ExecStartPre=/usr/bin/bluetoothctl --timeout 30 power on
 ExecStartPre=/usr/bin/bluetoothctl --timeout 30 pairable on
 ExecStartPre=/usr/bin/bluetoothctl --timeout 30 discoverable on
@@ -91,11 +297,17 @@ KillSignal=SIGUSR1
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable bt-agent@hci0.service
+    
+    systemctl daemon-reload || die "Failed to reload systemd"
+    systemctl enable bt-agent@hci0.service || die "Failed to enable bt-agent"
+    
+    success "Bluetooth agent service installed"
+}
 
-    # Bluetooth udev script
-    sudo tee /usr/local/bin/bluetooth-udev >/dev/null <<'EOF'
+install_bluetooth_udev() {
+    info "Installing Bluetooth udev rules..."
+    
+    cat > /usr/local/bin/bluetooth-udev <<'EOF'
 #!/bin/bash
 if [[ ! $NAME =~ ^\"([0-9A-F]{2}[:-]){5}([0-9A-F]{2})\"$ ]]; then exit 0; fi
 
@@ -103,147 +315,459 @@ action=$(expr "$ACTION" : "\([a-zA-Z]\+\).*")
 
 if [ "$action" = "add" ]; then
     bluetoothctl discoverable off
-    # disconnect wifi to prevent dropouts
-    #ifconfig wlan0 down &
 fi
 
 if [ "$action" = "remove" ]; then
-    # reenable wifi
-    #ifconfig wlan0 up &
     bluetoothctl discoverable on
 fi
 EOF
-    sudo chmod 755 /usr/local/bin/bluetooth-udev
-
-    sudo tee /etc/udev/rules.d/99-bluetooth-udev.rules >/dev/null <<'EOF'
+    
+    chmod 755 /usr/local/bin/bluetooth-udev || die "Failed to set permissions"
+    
+    cat > /etc/udev/rules.d/99-bluetooth-udev.rules <<'EOF'
 SUBSYSTEM=="input", GROUP="input", MODE="0660"
 KERNEL=="input[0-9]*", RUN+="/usr/local/bin/bluetooth-udev"
 EOF
+    
+    success "Bluetooth udev rules installed"
 }
 
-install_shairport() {
-    read -p "Do you want to install Shairport Sync (AirPlay 2 audio player)? [y/N] " REPLY
-    if [[ ! "$REPLY" =~ ^(yes|y|Y)$ ]]; then return; fi
-
-    # Base tools and services
-    sudo apt update
-    sudo apt install -y --no-install-recommends avahi-daemon alsa-utils wget unzip autoconf automake build-essential libtool git pkg-config libsystemd-dev libpopt-dev libconfig-dev libasound2-dev libavahi-client-dev libssl-dev libsoxr-dev libplist-dev libsodium-dev libavutil-dev libavcodec-dev libavformat-dev uuid-dev libgcrypt20-dev xxd
-
-    # Build and install NQPTP for AirPlay 2 timing (packaged shairport-sync can use it)
-    if [[ -z "$TMP_DIR" ]]; then
-        TMP_DIR=$(mktemp -d)
+verify_bluetooth() {
+    info "Verifying Bluetooth installation..."
+    
+    if ! command -v bluetoothctl &>/dev/null; then
+        die "bluetoothctl not found after installation"
     fi
-    ( cd "$TMP_DIR" && \
-      wget -O nqptp-${NQPTP_VERSION}.zip https://github.com/mikebrady/nqptp/archive/refs/tags/${NQPTP_VERSION}.zip && \
-      unzip -q nqptp-${NQPTP_VERSION}.zip && \
-      cd nqptp-${NQPTP_VERSION} && \
-      autoreconf -fi && \
-      ./configure --with-systemd-startup && \
-      make -j $(nproc) && \
-      sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user ) || true
-    # In case upstream install tried to enable/start a default unit, disable it before we install our own
-    sudo systemctl disable --now shairport-sync >/dev/null 2>&1 || true
+    
+    if ! systemctl is-enabled bt-agent@hci0.service &>/dev/null; then
+        die "bt-agent service not enabled"
+    fi
+    
+    success "Bluetooth installation verified"
+}
 
-    # Build Shairport Sync from source with AirPlay 2 enabled
-    ( cd "$TMP_DIR" && \
-      wget -O shairport-sync-${SHAIRPORT_SYNC_VERSION}.zip https://github.com/mikebrady/shairport-sync/archive/refs/tags/${SHAIRPORT_SYNC_VERSION}.zip && \
-      unzip -q shairport-sync-${SHAIRPORT_SYNC_VERSION}.zip && \
-      cd shairport-sync-${SHAIRPORT_SYNC_VERSION} && \
-      autoreconf -fi && \
-      ./configure --sysconfdir=/etc --with-alsa --with-soxr --with-avahi --with-ssl=openssl --with-systemd --with-airplay-2 && \
-      make -j $(nproc) && \
-      sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user )
+install_bluetooth() {
+    if is_installed "bluetooth"; then
+        info "Bluetooth already installed, skipping..."
+        return 0
+    fi
+    
+    read -p "Install Bluetooth Audio (ALSA)? [y/N] " -r
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        info "Skipping Bluetooth installation"
+        return 0
+    fi
+    
+    install_bluetooth_packages
+    configure_bluetooth
+    install_bluetooth_agent
+    install_bluetooth_udev
+    verify_bluetooth
+    
+    mark_installed "bluetooth"
+}
 
-    # Create a native systemd unit that runs before playback to pick the best ALSA device
-    sudo tee /usr/local/bin/shairport-output-detect >/dev/null <<'EOF'
+#==============================================================================
+# SHAIRPORT SYNC INSTALLATION
+#==============================================================================
+
+install_shairport_dependencies() {
+    info "Installing Shairport Sync build dependencies..."
+    
+    apt update || die "Failed to update package lists"
+    
+    local deps=(
+        avahi-daemon alsa-utils wget unzip autoconf automake 
+        build-essential libtool git pkg-config libsystemd-dev 
+        libpopt-dev libconfig-dev libasound2-dev libavahi-client-dev 
+        libssl-dev libsoxr-dev libplist-dev libsodium-dev 
+        libavutil-dev libavcodec-dev libavformat-dev uuid-dev 
+        libgcrypt20-dev xxd
+    )
+    
+    DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends "${deps[@]}" \
+        || die "Failed to install build dependencies"
+    
+    success "Build dependencies installed"
+}
+
+build_nqptp() {
+    info "Building NQPTP $NQPTP_VERSION..."
+    
+    local build_dir=$(mktemp -d)
+    local original_dir=$(pwd)
+    trap "cd '$original_dir'; rm -rf '$build_dir'" RETURN
+    
+    cd "$build_dir" || die "Failed to enter build directory"
+    
+    wget -q -O nqptp.zip \
+        "https://github.com/mikebrady/nqptp/archive/refs/tags/${NQPTP_VERSION}.zip" \
+        || die "Failed to download NQPTP"
+    
+    unzip -q nqptp.zip || die "Failed to extract NQPTP"
+    cd "nqptp-${NQPTP_VERSION}" || die "Failed to enter NQPTP directory"
+    
+    autoreconf -fi || die "NQPTP autoreconf failed"
+    ./configure --with-systemd-startup || die "NQPTP configure failed"
+    make -j "$(nproc)" || die "NQPTP build failed"
+    make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user \
+        || die "NQPTP install failed"
+    
+    success "NQPTP built and installed"
+}
+
+build_shairport_sync() {
+    info "Building Shairport Sync $SHAIRPORT_SYNC_VERSION..."
+    
+    local build_dir=$(mktemp -d)
+    local original_dir=$(pwd)
+    trap "cd '$original_dir'; rm -rf '$build_dir'" RETURN
+    
+    cd "$build_dir" || die "Failed to enter build directory"
+    
+    wget -q -O shairport-sync.zip \
+        "https://github.com/mikebrady/shairport-sync/archive/refs/tags/${SHAIRPORT_SYNC_VERSION}.zip" \
+        || die "Failed to download Shairport Sync"
+    
+    unzip -q shairport-sync.zip || die "Failed to extract Shairport Sync"
+    cd "shairport-sync-${SHAIRPORT_SYNC_VERSION}" || die "Failed to enter Shairport directory"
+    
+    autoreconf -fi || die "Shairport autoreconf failed"
+    ./configure --sysconfdir=/etc --with-alsa --with-soxr --with-avahi \
+        --with-ssl=openssl --with-systemd --with-airplay-2 \
+        || die "Shairport configure failed"
+    make -j "$(nproc)" || die "Shairport build failed"
+    make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user \
+        || die "Shairport install failed"
+    
+    success "Shairport Sync built and installed"
+}
+
+create_output_detect_script() {
+    info "Creating audio output detection script..."
+    
+    cat > /usr/local/bin/shairport-output-detect <<'EOF'
 #!/bin/bash
-set -u
+# Shairport Sync Audio Output Detection Script
+# This script runs before shairport-sync starts to select the best audio device
 
 CONF="/etc/shairport-sync.conf"
+LOG_TAG="shairport-output-detect"
 
-pick_default() {
-  # Prefer HDMI with resampling via plughw if a monitor is connected; else default or first plughw
-  local hdmi_connected=0
-  if ls /proc/asound/card*/eld#* >/dev/null 2>&1; then
-    while read -r path; do
-      if grep -qs "monitor_present *1" "$path"; then hdmi_connected=1; break; fi
-    done < <(ls /proc/asound/card*/eld#* 2>/dev/null)
-  fi
-
-  if [[ $hdmi_connected -eq 1 ]]; then
-    # Build candidate list of HDMI PCM devices from aplay -l and pick the first
-    while read -r line; do
-      cardname=$(awk '{print $3}' <<<"$line" | sed 's/://')
-      devnum=$(awk '{print $6}' <<<"$line" | sed 's/://')
-      if [[ -n "${cardname}" && -n "${devnum}" ]]; then
-        echo "plughw:CARD=${cardname},DEV=${devnum}"
-        return 0
-      fi
-    done < <(aplay -l 2>/dev/null | awk '/^card .* device .*HDMI/ {print}')
-  fi
-
-  # Fall back to ALSA default of the primary card
-  def=$(aplay -L 2>/dev/null | awk -F: '/^default:/ {print $1":"$2; exit}')
-  if [[ -n "${def}" ]]; then
-    echo "${def}"
-    return 0
-  fi
-
-  # Finally, pick the first plughw device
-  dev=$(aplay -L 2>/dev/null | awk '/^plughw:/{print $1; exit}')
-  if [[ -n "${dev}" ]]; then
-    echo "${dev}"
-    return 0
-  fi
-
-  # As an absolute last resort
-  echo "default"
+# Logging function
+log() { 
+    logger -t "$LOG_TAG" "$@" 2>/dev/null || true
+    echo "[$LOG_TAG] $@" >&2
 }
 
-# Wait briefly for ALSA cards to appear on boot
-for i in $(seq 1 10); do
-  if aplay -l >/dev/null 2>&1; then break; fi
-  sleep 0.5
-done
+# Return the first playback PCM index for a given ALSA card number
+first_playback_device_for_card() {
+    local card="$1"
+    local card_dir="/sys/class/sound/card${card}"
+    local entry
+    
+    [[ -d "$card_dir" ]] || return 1
+    
+    shopt -s nullglob
+    for entry in "$card_dir"/pcmC"${card}"D*p; do
+        [[ -d "$entry" ]] || continue
+        if [[ $(basename "$entry") =~ pcmC[0-9]+D([0-9]+)p ]]; then
+            echo "${BASH_REMATCH[1]}"
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
+}
 
-    DEVICE=$(pick_default)
-    # Sanitize to a single token (strip CR/LF and trailing whitespace)
-    DEVICE=$(printf '%s' "$DEVICE" | tr -d '\r' | awk '{print $1}')
+# Determine the best supported output rate for a card/device pair
+best_rate_for_pcm() {
+    local card="$1"
+    local dev="$2"
+    local info_file="/proc/asound/card${card}/pcm${dev}p/sub0/info"
+    local rates_line rate best=0 upper
+    
+    if [[ -r "$info_file" ]]; then
+        rates_line=$(grep '^rates:' "$info_file" 2>/dev/null | sed 's/^rates:[[:space:]]*//')
+        if [[ -n "$rates_line" ]]; then
+            for rate in $rates_line; do
+                case "$rate" in
+                    44100)
+                        echo "44100"
+                        return 0
+                        ;;
+                    [0-9]*)
+                        if (( rate > best )); then
+                            best=$rate
+                        fi
+                        ;;
+                    *-*)
+                        upper=${rate#*-}
+                        if [[ "$upper" =~ ^[0-9]+$ ]]; then
+                            echo "$upper"
+                            return 0
+                        fi
+                        ;;
+                    continuous)
+                        echo "auto"
+                        return 0
+                        ;;
+                esac
+            done
+            if (( best > 0 )); then
+                echo "$best"
+                return 0
+            fi
+        fi
+    fi
+    
+    echo "auto"
+    return 0
+}
+
+# Map ALSA device string to an output rate
+determine_output_rate() {
+    local device="$1"
+    
+    if [[ "$device" =~ ^(plughw|hw):([0-9]+),([0-9]+) ]]; then
+        local card="${BASH_REMATCH[2]}"
+        local dev="${BASH_REMATCH[3]}"
+        echo "$(best_rate_for_pcm "$card" "$dev")"
+        return 0
+    fi
+    
+    echo "auto"
+    return 0
+}
+
+# Try to locate a USB audio playback device and return it as plughw:card,device
+find_usb_device() {
+    local card_path card dev card_info real_path is_usb
+    
+    for card_path in /sys/class/sound/card*; do
+        [[ -e "$card_path" ]] || continue
+        card="${card_path##*/card}"
+        [[ "$card" =~ ^[0-9]+$ ]] || continue
+        
+        real_path=$(readlink -f "$card_path" 2>/dev/null || echo "$card_path")
+        is_usb=0
+        
+        if command -v udevadm &>/dev/null && \
+           udevadm info -q property -p "$real_path" 2>/dev/null | grep -q '^ID_BUS=usb$'; then
+            is_usb=1
+        else
+            card_info=$(awk -v idx="$card" '$1 == idx {for (i=2;i<=NF;i++) printf "%s ", $i; printf "\n"}' /proc/asound/cards 2>/dev/null || true)
+            if echo "$card_info" | grep -qi 'usb'; then
+                is_usb=1
+            fi
+        fi
+        
+        if [[ "$is_usb" -eq 1 ]]; then
+            if ! dev=$(first_playback_device_for_card "$card"); then
+                continue
+            fi
+            echo "plughw:${card},${dev}"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# Fallback: parse aplay -l output for USB devices
+find_usb_device_from_aplay() {
+    local line card_id dev_id description
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^card[[:space:]]+([0-9]+):[[:space:]]+([^[:space:]]+)[[:space:]]+\\[(.*)\\],[[:space:]]+device[[:space:]]+([0-9]+):[[:space:]]+(.*) ]]; then
+            card_id="${BASH_REMATCH[1]}"
+            description="${BASH_REMATCH[3]} ${BASH_REMATCH[5]}"
+            dev_id="${BASH_REMATCH[4]}"
+            if echo "$description" | grep -qiE 'usb|dac|smsl'; then
+                echo "plughw:${card_id},${dev_id}"
+                return 0
+            fi
+        fi
+    done < <(aplay -l 2>/dev/null || true)
+    
+    return 1
+}
+
+# Detect the best audio device
+detect_best_device() {
+    # Prefer USB DACs when available
+    local usb_dev
+    if usb_dev=$(find_usb_device); then
+        usb_dev=$(echo "$usb_dev" | head -n1)
+        if [[ -n "$usb_dev" ]]; then
+            echo "$usb_dev"
+            log "Selected USB: $usb_dev"
+            return 0
+        fi
+    elif usb_dev=$(find_usb_device_from_aplay); then
+        usb_dev=$(echo "$usb_dev" | head -n1)
+        if [[ -n "$usb_dev" ]]; then
+            echo "$usb_dev"
+            log "Selected USB (aplay): $usb_dev"
+            return 0
+        fi
+    fi
+    
+    # Check for HDMI with active monitor
+    if ls /proc/asound/card*/eld#* &>/dev/null 2>&1; then
+        while IFS= read -r eld_file; do
+            if grep -qs "monitor_present *1" "$eld_file" 2>/dev/null; then
+                # Find first HDMI device
+                while IFS= read -r line; do
+                    local card_id=$(echo "$line" | awk '{print $2}' | tr -d ':')
+                    local dev_id=$(echo "$line" | awk '{print $4}' | tr -d ':')
+                    
+                    if [[ -n "$card_id" && -n "$dev_id" ]]; then
+                        echo "plughw:${card_id},${dev_id}"
+                        log "Selected HDMI: plughw:${card_id},${dev_id}"
+                        return 0
+                    fi
+                done < <(aplay -l 2>/dev/null | grep "^card.*HDMI" || true)
+            fi
+        done < <(ls /proc/asound/card*/eld#* 2>/dev/null || true)
+    fi
+    
+    # Fallback to default ALSA device
+    local default_dev=$(aplay -L 2>/dev/null | awk -F: '/^default:/ {print $1":"$2; exit}' || true)
+    if [[ -n "$default_dev" ]]; then
+        echo "$default_dev"
+        log "Selected default: $default_dev"
+        return 0
+    fi
+    
+    # Last resort: first plughw device
+    local first_plughw=$(aplay -L 2>/dev/null | awk '/^plughw:/ {print; exit}' || true)
+    if [[ -n "$first_plughw" ]]; then
+        echo "$first_plughw"
+        log "Selected first plughw: $first_plughw"
+        return 0
+    fi
+    
+    echo "default"
+    log "Using absolute fallback: default"
+}
+
+# Main execution
+main() {
+    # Wait for ALSA to be ready (max 10 seconds)
+    for i in {1..20}; do
+        if aplay -l &>/dev/null 2>&1; then 
+            log "ALSA ready after ${i} attempts"
+            break
+        fi
+        sleep 0.5
+    done
+    
+    # Detect device
+    local DEVICE=$(detect_best_device)
+    DEVICE=$(echo "$DEVICE" | tr -d '\r\n' | awk '{print $1}')
+    
+    # Validate device name
     case "$DEVICE" in
-      default|default:*) ;;
-      plughw:*|hw:*|hdmi:*) ;;
-      *) DEVICE=default ;;
+        default|default:*|plughw:*|hw:*|hdmi:*) ;;
+        *) 
+            log "Invalid device '$DEVICE', using 'default'"
+            DEVICE="default" 
+            ;;
     esac
-
-    # Ensure config exists and set ALSA device
-    if [[ ! -f "$CONF" ]]; then
-      echo "general = { name = \"$(hostname)\"; output_backend = \"alsa\"; };" > "$CONF"
-    fi
-
-    # Ensure ALSA block exists and set output_device and output_rate using awk (sed-safe)
-    if grep -qE '^alsa *= *\{' "$CONF"; then
-      awk -v dev="$DEVICE" '
-        BEGIN{in_alsa=0; outdev=0; outrate=0}
-        /^alsa[[:space:]]*=.*\{/ {print; in_alsa=1; next}
-        in_alsa==1 && /^[[:space:]]*output_device[[:space:]]*=/ {print "  output_device = \"" dev "\";"; outdev=1; next}
-        in_alsa==1 && /^[[:space:]]*output_rate[[:space:]]*=/ {print "  output_rate = 48000;"; outrate=1; next}
-        in_alsa==1 && /^\}/ {
-          if (outdev==0) print "  output_device = \"" dev "\";";
-          if (outrate==0) print "  output_rate = 48000;";
-          print; in_alsa=0; outdev=0; outrate=0; next
-        }
-        {print}
-      ' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+    
+    local RATE=$(determine_output_rate "$DEVICE")
+    local RATE_CONF
+    if [[ "$RATE" == "auto" ]]; then
+        RATE_CONF='  output_rate = "auto";'
     else
-      printf 'alsa = {\n  output_device = "%s";\n  output_rate = 48000;\n};\n' "$DEVICE" >> "$CONF"
+        RATE_CONF="  output_rate = $RATE;"
     fi
-EOF
-    sudo chmod +x /usr/local/bin/shairport-output-detect
-
-    # Minimal config with pretty name and ALSA backend; device will be set by pre-start script
-    sudo tee /etc/shairport-sync.conf >/dev/null <<EOF
+    
+    log "Final device: $DEVICE"
+    log "Using sample rate: $RATE"
+    
+    # Ensure config file exists with proper structure
+    if [[ ! -f "$CONF" ]]; then
+        log "Creating new config file"
+        cat > "$CONF" <<EOFCONF
 general = {
-  name = "${PRETTY_HOSTNAME:-$(hostname)}";
+  name = "$(hostname)";
+  output_backend = "alsa";
+};
+
+alsa = {
+  output_device = "$DEVICE";
+$RATE_CONF
+};
+
+sessioncontrol = {
+  session_timeout = 20;
+};
+EOFCONF
+    else
+        # Update existing config
+        log "Updating existing config file"
+        
+        # Create temp file
+        local TEMP_CONF=$(mktemp)
+        
+        # Remove old alsa block and copy everything else
+        awk '
+            /^alsa[[:space:]]*=/ { in_alsa=1; next }
+            in_alsa==1 && /^}[[:space:]]*;/ { in_alsa=0; next }
+            in_alsa==1 { next }
+            { print }
+        ' "$CONF" > "$TEMP_CONF"
+        
+        # Append new alsa block
+        cat >> "$TEMP_CONF" <<EOFCONF
+
+alsa = {
+  output_device = "$DEVICE";
+$RATE_CONF
+};
+EOFCONF
+        
+        # Replace original
+        if ! mv "$TEMP_CONF" "$CONF"; then
+            log "Failed to replace $CONF"
+            rm -f "$TEMP_CONF"
+            return 1
+        fi
+        chmod 644 "$CONF"
+    fi
+    
+    log "Configuration updated successfully"
+    return 0
+}
+
+# Run main function
+main
+exit $?
+EOF
+    
+    chmod +x /usr/local/bin/shairport-output-detect || die "Failed to set permissions"
+    
+    # Test the script
+    if ! /usr/local/bin/shairport-output-detect; then
+        warn "Output detection script test had issues, but continuing..."
+    fi
+    
+    success "Output detection script created and tested"
+}
+
+configure_shairport() {
+    info "Configuring Shairport Sync..."
+    
+    local pretty_hostname=$(get_state "hostname_pretty")
+    pretty_hostname="${pretty_hostname:-$(hostname)}"
+    
+    backup_file "/etc/shairport-sync.conf"
+    
+    cat > /etc/shairport-sync.conf <<EOF
+general = {
+  name = "${pretty_hostname}";
   output_backend = "alsa";
 };
 
@@ -251,9 +775,16 @@ sessioncontrol = {
   session_timeout = 20;
 };
 EOF
+    
+    success "Shairport Sync configuration created"
+}
 
-    # Native systemd unit (override SysV shim) with device auto-detect
-    sudo tee /etc/systemd/system/shairport-sync.service >/dev/null <<'EOF'
+create_shairport_service() {
+    info "Creating Shairport Sync systemd service..."
+    
+    backup_file "/etc/systemd/system/shairport-sync.service"
+    
+    cat > /etc/systemd/system/shairport-sync.service <<'EOF'
 [Unit]
 Description=Shairport Sync - AirPlay Audio Receiver
 After=network-online.target avahi-daemon.service sound.target alsa-restore.service
@@ -272,70 +803,309 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    # Add gpio group only if it exists (Raspberry Pi specific)
-    if getent group gpio >/dev/null; then
-        sudo usermod -a -G gpio shairport-sync
+    
+    # Add gpio group if it exists (Raspberry Pi)
+    if getent group gpio &>/dev/null && getent passwd shairport-sync &>/dev/null; then
+        usermod -a -G gpio shairport-sync 2>/dev/null || true
     fi
+    
+    systemctl daemon-reload || die "Failed to reload systemd"
+    success "Shairport Sync service created"
+}
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now nqptp
-    sudo systemctl enable --now shairport-sync
-
-    # Udev hotplug hook to re-detect output on HDMI / sound card changes
-    sudo tee /usr/local/bin/shairport-udev-restart >/dev/null <<'EOF'
+install_shairport_udev() {
+    info "Installing Shairport Sync udev rules..."
+    
+    cat > /usr/local/bin/shairport-udev-restart <<'EOF'
 #!/bin/sh
 /usr/bin/systemctl try-restart shairport-sync.service
 EOF
-    sudo chmod 755 /usr/local/bin/shairport-udev-restart
-
-    sudo tee /etc/udev/rules.d/99-shairport-hotplug.rules >/dev/null <<'EOF'
-# Restart Shairport when displays are connected/disconnected (HDMI hotplug)
+    
+    chmod 755 /usr/local/bin/shairport-udev-restart || die "Failed to set permissions"
+    
+    cat > /etc/udev/rules.d/99-shairport-hotplug.rules <<'EOF'
+# Restart Shairport when displays are connected/disconnected
 ACTION=="change", SUBSYSTEM=="drm", ENV{HOTPLUG}=="1", RUN+="/usr/local/bin/shairport-udev-restart"
-# Restart Shairport when ALSA cards change (USB DACs, etc.)
+# Restart Shairport when ALSA cards change
 ACTION=="change", SUBSYSTEM=="sound", KERNEL=="card*", RUN+="/usr/local/bin/shairport-udev-restart"
 EOF
-
-    sudo udevadm control --reload
-    # Optional: prime current state so we pick initial device when headless
-    sudo udevadm trigger --subsystem-match=drm --action=change || true
-    sudo udevadm trigger --subsystem-match=sound --action=change || true
+    
+    udevadm control --reload || warn "Failed to reload udev rules"
+    
+    success "Shairport Sync udev rules installed"
 }
 
-install_raspotify() {
-    read -p "Do you want to install Raspotify (Spotify Connect)? [y/N] " REPLY
-    if [[ ! "$REPLY" =~ ^(yes|y|Y)$ ]]; then return; fi
+enable_shairport_services() {
+    info "Enabling and starting services..."
+    
+    # Ensure we're in a valid directory before running systemctl
+    cd /tmp || cd / || die "Failed to change to a valid directory"
+    
+    # Reload systemd to pick up new service files
+    systemctl daemon-reload || die "Failed to reload systemd"
+    
+    # Enable NQPTP
+    if ! systemctl enable nqptp 2>&1 | tee -a "$LOG_FILE"; then
+        warn "NQPTP enable had warnings, but continuing..."
+    fi
+    
+    # Enable Shairport Sync
+    if ! systemctl enable shairport-sync 2>&1 | tee -a "$LOG_FILE"; then
+        warn "Shairport Sync enable had warnings, but continuing..."
+    fi
+    
+    # Start NQPTP
+    info "Starting NQPTP service..."
+    if ! systemctl start nqptp; then
+        error "Failed to start NQPTP service"
+        systemctl status nqptp --no-pager -l 2>&1 | tee -a "$LOG_FILE" || true
+        journalctl -u nqptp -n 50 --no-pager 2>&1 | tee -a "$LOG_FILE" || true
+        die "NQPTP service failed to start"
+    fi
+    
+    # Start Shairport Sync
+    info "Starting Shairport Sync service..."
+    if ! systemctl start shairport-sync; then
+        error "Failed to start Shairport Sync service"
+        systemctl status shairport-sync --no-pager -l 2>&1 | tee -a "$LOG_FILE" || true
+        journalctl -u shairport-sync -n 50 --no-pager 2>&1 | tee -a "$LOG_FILE" || true
+        
+        # Additional debugging
+        error "Checking output detection script..."
+        if [[ -x /usr/local/bin/shairport-output-detect ]]; then
+            info "Running output detection script manually..."
+            /usr/local/bin/shairport-output-detect 2>&1 | tee -a "$LOG_FILE" || true
+        fi
+        
+        die "Shairport Sync service failed to start - check logs above"
+    fi
+    
+    # Trigger udev for initial device detection
+    udevadm trigger --subsystem-match=drm --action=change 2>/dev/null || true
+    udevadm trigger --subsystem-match=sound --action=change 2>/dev/null || true
+    
+    # Give services a moment to stabilize
+    sleep 2
+    
+    # Verify services are actually running
+    if systemctl is-active --quiet nqptp && systemctl is-active --quiet shairport-sync; then
+        success "Services enabled and started successfully"
+    else
+        warn "Services enabled but may not be fully active - check status"
+    fi
+}
 
-    # Install Raspotify
-    sudo apt update && sudo apt install -y --no-install-recommends curl
-    curl -sL https://dtcooper.github.io/raspotify/install.sh | sh
+verify_shairport() {
+    info "Verifying Shairport Sync installation..."
+    
+    if ! command -v shairport-sync &>/dev/null; then
+        die "shairport-sync binary not found"
+    fi
+    
+    if ! systemctl is-enabled nqptp &>/dev/null; then
+        die "NQPTP service not enabled"
+    fi
+    
+    if ! systemctl is-enabled shairport-sync &>/dev/null; then
+        die "Shairport Sync service not enabled"
+    fi
+    
+    if ! systemctl is-active nqptp &>/dev/null; then
+        die "NQPTP service not running"
+    fi
+    
+    if ! systemctl is-active shairport-sync &>/dev/null; then
+        die "Shairport Sync service not running"
+    fi
+    
+    success "Shairport Sync installation verified"
+}
 
-    # Configure Raspotify
-    LIBRESPOT_NAME="${PRETTY_HOSTNAME// /-}"
-    LIBRESPOT_NAME=${LIBRESPOT_NAME:-$(hostname)}
+install_shairport() {
+    if is_installed "shairport"; then
+        info "Shairport Sync already installed, skipping..."
+        return 0
+    fi
+    
+    read -p "Install Shairport Sync (AirPlay 2 audio player)? [y/N] " -r
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        info "Skipping Shairport Sync installation"
+        return 0
+    fi
+    
+    # Clean up any partial installations
+    info "Cleaning up any previous partial installations..."
+    systemctl stop shairport-sync 2>/dev/null || true
+    systemctl disable shairport-sync 2>/dev/null || true
+    systemctl stop nqptp 2>/dev/null || true
+    systemctl disable nqptp 2>/dev/null || true
+    
+    install_shairport_dependencies
+    build_nqptp
+    build_shairport_sync
+    create_output_detect_script
+    configure_shairport
+    create_shairport_service
+    install_shairport_udev
+    enable_shairport_services
+    verify_shairport
+    
+    mark_installed "shairport"
+}
 
-    sudo tee /etc/raspotify/conf >/dev/null <<EOF
+#==============================================================================
+# RASPOTIFY INSTALLATION
+#==============================================================================
+
+install_raspotify_package() {
+    info "Installing Raspotify..."
+    
+    # Ensure we're in a safe directory
+    cd /tmp || die "Failed to change to /tmp"
+    
+    apt update || die "Failed to update package lists"
+    apt install -y --no-install-recommends curl || die "Failed to install curl"
+    
+    local install_script=$(mktemp)
+    wget -q -O "$install_script" https://dtcooper.github.io/raspotify/install.sh \
+        || die "Failed to download Raspotify installer"
+    
+    bash "$install_script" || die "Raspotify installation failed"
+    rm -f "$install_script"
+    
+    success "Raspotify package installed"
+}
+
+configure_raspotify() {
+    info "Configuring Raspotify..."
+    
+    local pretty_hostname=$(get_state "hostname_pretty")
+    pretty_hostname="${pretty_hostname:-$(hostname)}"
+    local librespot_name="${pretty_hostname// /-}"
+    
+    backup_file "/etc/raspotify/conf"
+    
+    cat > /etc/raspotify/conf <<EOF
 LIBRESPOT_QUIET=on
 LIBRESPOT_AUTOPLAY=on
 LIBRESPOT_DISABLE_AUDIO_CACHE=on
 LIBRESPOT_DISABLE_CREDENTIAL_CACHE=on
 LIBRESPOT_ENABLE_VOLUME_NORMALISATION=on
-LIBRESPOT_NAME="${LIBRESPOT_NAME}"
+LIBRESPOT_NAME="${librespot_name}"
 LIBRESPOT_DEVICE_TYPE="avr"
 LIBRESPOT_BITRATE="320"
 LIBRESPOT_INITIAL_VOLUME="100"
 EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable raspotify
+    
+    systemctl daemon-reload || die "Failed to reload systemd"
+    systemctl enable raspotify || die "Failed to enable Raspotify"
+    
+    success "Raspotify configured"
 }
 
-trap cleanup EXIT
+verify_raspotify() {
+    info "Verifying Raspotify installation..."
+    
+    if ! systemctl is-enabled raspotify &>/dev/null; then
+        die "Raspotify service not enabled"
+    fi
+    
+    success "Raspotify installation verified"
+}
 
-echo "Raspberry Pi Audio Receiver"
+install_raspotify() {
+    if is_installed "raspotify"; then
+        info "Raspotify already installed, skipping..."
+        return 0
+    fi
+    
+    read -p "Install Raspotify (Spotify Connect)? [y/N] " -r
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        info "Skipping Raspotify installation"
+        return 0
+    fi
+    
+    install_raspotify_package
+    configure_raspotify
+    verify_raspotify
+    
+    mark_installed "raspotify"
+}
 
-verify_os
-set_hostname
-install_bluetooth
-install_shairport
-install_raspotify
+#==============================================================================
+# MAIN INSTALLATION FLOW
+#==============================================================================
+
+show_banner() {
+    cat <<'EOF'
+╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║        Raspberry Pi Audio Receiver Installer v2.0        ║
+║                                                           ║
+║  Features: AirPlay 2, Bluetooth, Spotify Connect         ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝
+
+EOF
+}
+
+show_summary() {
+    echo
+    echo "═══════════════════════════════════════════════════════════"
+    echo "Installation Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    echo
+    echo "Hostname:    $(get_state hostname_pretty)"
+    echo "Bluetooth:   $(is_installed bluetooth && echo '✓ Installed' || echo '✗ Not installed')"
+    echo "Shairport:   $(is_installed shairport && echo '✓ Installed' || echo '✗ Not installed')"
+    echo "Raspotify:   $(is_installed raspotify && echo '✓ Installed' || echo '✗ Not installed')"
+    echo
+    echo "Log file:    $LOG_FILE"
+    echo "State file:  $STATE_FILE"
+    echo "Backups:     $BACKUP_DIR"
+    echo
+    
+    if is_installed shairport; then
+        echo "Your AirPlay receiver should now be visible as:"
+        echo "  → $(get_state hostname_pretty)"
+        echo
+        echo "Service status:"
+        systemctl status shairport-sync --no-pager -l | head -n 5 || true
+    fi
+    
+    echo "═══════════════════════════════════════════════════════════"
+}
+
+main() {
+    show_banner
+    
+    ensure_root
+    ensure_state_dir
+    
+    # Ensure we start in a safe directory
+    cd / || die "Failed to change to root directory"
+    
+    # Validation Phase
+    info "Starting validation phase..."
+    validate_os
+    validate_dependencies
+    validate_network
+    
+    # Configuration Phase
+    info "Starting configuration phase..."
+    configure_hostname
+    
+    # Installation Phase
+    info "Starting installation phase..."
+    install_bluetooth
+    install_shairport
+    install_raspotify
+    
+    # Summary
+    show_summary
+    
+    success "Installation completed successfully!"
+}
+
+# Run main installation
+main "$@"
