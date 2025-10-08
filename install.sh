@@ -115,56 +115,131 @@ install_shairport() {
     read -p "Do you want to install Shairport Sync (AirPlay 2 audio player)? [y/N] " REPLY
     if [[ ! "$REPLY" =~ ^(yes|y|Y)$ ]]; then return; fi
 
+    # Base tools and services
     sudo apt update
-    # Add pkg-config and libsystemd-dev so systemd unit dirs are detected during install
-    sudo apt install -y --no-install-recommends wget unzip autoconf automake build-essential libtool git pkg-config libsystemd-dev libpopt-dev libconfig-dev libasound2-dev avahi-daemon libavahi-client-dev libssl-dev libsoxr-dev libplist-dev libsodium-dev libavutil-dev libavcodec-dev libavformat-dev uuid-dev libgcrypt20-dev xxd
+    sudo apt install -y --no-install-recommends avahi-daemon alsa-utils
 
+    # Build and install NQPTP for AirPlay 2 timing (packaged shairport-sync can use it)
     if [[ -z "$TMP_DIR" ]]; then
         TMP_DIR=$(mktemp -d)
     fi
+    ( cd "$TMP_DIR" && \
+      wget -O nqptp-${NQPTP_VERSION}.zip https://github.com/mikebrady/nqptp/archive/refs/tags/${NQPTP_VERSION}.zip && \
+      unzip -q nqptp-${NQPTP_VERSION}.zip && \
+      cd nqptp-${NQPTP_VERSION} && \
+      autoreconf -fi && \
+      ./configure --with-systemd-startup && \
+      make -j $(nproc) && \
+      sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user )
 
-    cd $TMP_DIR
+    # Prefer packaged Shairport on Debian 12/13 to avoid FFmpeg-7 segfaults on source builds
+    sudo apt install -y --no-install-recommends shairport-sync
 
-    # Install NQPTP
-    wget -O nqptp-${NQPTP_VERSION}.zip https://github.com/mikebrady/nqptp/archive/refs/tags/${NQPTP_VERSION}.zip
-    unzip nqptp-${NQPTP_VERSION}.zip
-    cd nqptp-${NQPTP_VERSION}
-    autoreconf -fi
-    ./configure --with-systemd-startup
-    make -j $(nproc)
-    # Explicitly set systemd unit directories for Debian
-    sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user
-    cd ..
-    rm -rf nqptp-${NQPTP_VERSION}
+    # Create a native systemd unit that runs before playback to pick the best ALSA device
+    sudo tee /usr/local/bin/shairport-output-detect >/dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
 
-    # Install Shairport Sync
-    wget -O shairport-sync-${SHAIRPORT_SYNC_VERSION}.zip https://github.com/mikebrady/shairport-sync/archive/refs/tags/${SHAIRPORT_SYNC_VERSION}.zip
-    unzip shairport-sync-${SHAIRPORT_SYNC_VERSION}.zip
-    cd shairport-sync-${SHAIRPORT_SYNC_VERSION}
-    autoreconf -fi
-    ./configure --sysconfdir=/etc --with-alsa --with-soxr --with-avahi --with-ssl=openssl --with-systemd --with-airplay-2
-    make -j $(nproc)
-    # Explicitly set systemd unit directories for Debian
-    sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user
-    cd ..
-    rm -rf shairport-sync-${SHAIRPORT_SYNC_VERSION}
+CONF="/etc/shairport-sync.conf"
 
-    # Configure Shairport Sync
+pick_default() {
+  # Prefer HDMI if a monitor is connected; else analog/default
+  local chosen="default"
+  if ls /proc/asound/card*/eld#* &>/dev/null; then
+    # Map common HDA HDMI indices to ALSA hdmi DEV numbers 0..3
+    # For card N, ELD index K typically corresponds to hdmi DEV=K
+    local card_index=0
+    while read -r path; do
+      if grep -qs "monitor_present *1" "$path"; then
+        # Extract ELD index (e.g., eld#0.1 -> 1)
+        idx=$(basename "$path" | awk -F'.' '{print $2}')
+        # Determine CARD name for this card index from aplay -L
+        card_name=$(aplay -L 2>/dev/null | awk -v ci="$card_index" '/^hdmi:CARD=/{print $1}' | sed -n "$(($idx+1))p" | sed -E 's/^hdmi:CARD=([^,]+).*/\1/')
+        if [[ -n "${card_name:-}" ]]; then
+          echo "hdmi:CARD=${card_name},DEV=${idx}"
+          return 0
+        fi
+      fi
+      card_index=$((card_index+1))
+    done < <(ls /proc/asound/card*/eld#* 2>/dev/null | sort)
+  fi
+  # Fall back to system default or first plughw device
+  if aplay -L 2>/dev/null | grep -qx "default"; then
+    echo "default"
+  else
+    dev=$(aplay -L 2>/dev/null | awk '/^plughw:|^hw:/{print $1; exit}')
+    echo "${dev:-default}"
+  fi
+}
+
+DEVICE=$(pick_default)
+
+# Ensure config exists and set ALSA device
+if [[ ! -f "$CONF" ]]; then
+  echo "general = { name = \"$(hostname)\"; output_backend = \"alsa\"; };" > "$CONF"
+fi
+
+# If an alsa block exists, update or insert output_device; otherwise add a new block
+if grep -qE '^alsa *= *\{' "$CONF"; then
+  if grep -qE '^[[:space:]]*output_device[[:space:]]*=' "$CONF"; then
+    sed -i -E "s#(^[[:space:]]*output_device[[:space:]]*=).*#\1 \"${DEVICE}\";#" "$CONF"
+  else
+    # Insert before closing brace of the alsa block
+    awk -v dev="$DEVICE" '
+      BEGIN{ins=0}
+      /^alsa[[:space:]]*=.*\{/ {print; ins=1; next}
+      ins==1 && /^\}/ {print "  output_device = \"" dev "\";"; ins=0}
+      {print}
+    ' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+  fi
+else
+  cat <<EOC >> "$CONF"
+alsa = {
+  output_device = "${DEVICE}";
+};
+EOC
+fi
+EOF
+    sudo chmod +x /usr/local/bin/shairport-output-detect
+
+    # Minimal config with pretty name and ALSA backend; device will be set by pre-start script
     sudo tee /etc/shairport-sync.conf >/dev/null <<EOF
 general = {
   name = "${PRETTY_HOSTNAME:-$(hostname)}";
   output_backend = "alsa";
-}
+};
 
 sessioncontrol = {
   session_timeout = 20;
 };
 EOF
 
+    # Native systemd unit (override SysV shim) with device auto-detect
+    sudo tee /etc/systemd/system/shairport-sync.service >/dev/null <<'EOF'
+[Unit]
+Description=Shairport Sync - AirPlay Audio Receiver
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+User=shairport-sync
+Group=shairport-sync
+SupplementaryGroups=audio
+PermissionsStartOnly=true
+ExecStartPre=/usr/local/bin/shairport-output-detect
+ExecStart=/usr/bin/shairport-sync -c /etc/shairport-sync.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     # Add gpio group only if it exists (Raspberry Pi specific)
     if getent group gpio >/dev/null; then
         sudo usermod -a -G gpio shairport-sync
     fi
+
+    sudo systemctl daemon-reload
     sudo systemctl enable --now nqptp
     sudo systemctl enable --now shairport-sync
 }
