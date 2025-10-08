@@ -923,7 +923,12 @@ verify_shairport() {
 
 install_shairport() {
     if is_installed "shairport"; then
-        info "Shairport Sync already installed, skipping..."
+        info "Shairport Sync already installed, refreshing configuration..."
+        create_output_detect_script
+        create_shairport_service
+        install_shairport_udev
+        systemctl daemon-reload || warn "Failed to reload systemd after refresh"
+        systemctl try-restart shairport-sync 2>/dev/null || true
         return 0
     fi
     
