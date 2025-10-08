@@ -125,18 +125,6 @@ install_shairport() {
 
     cd $TMP_DIR
 
-    # Install ALAC
-    wget -O alac-master.zip https://github.com/mikebrady/alac/archive/refs/heads/master.zip
-    unzip alac-master.zip
-    cd alac-master
-    autoreconf -fi
-    ./configure
-    make -j $(nproc)
-    sudo make install
-    sudo ldconfig
-    cd ..
-    rm -rf alac-master
-
     # Install NQPTP
     wget -O nqptp-${NQPTP_VERSION}.zip https://github.com/mikebrady/nqptp/archive/refs/tags/${NQPTP_VERSION}.zip
     unzip nqptp-${NQPTP_VERSION}.zip
@@ -154,7 +142,7 @@ install_shairport() {
     unzip shairport-sync-${SHAIRPORT_SYNC_VERSION}.zip
     cd shairport-sync-${SHAIRPORT_SYNC_VERSION}
     autoreconf -fi
-    ./configure --sysconfdir=/etc --with-alsa --with-soxr --with-avahi --with-ssl=openssl --with-systemd --with-airplay-2 --with-apple-alac
+    ./configure --sysconfdir=/etc --with-alsa --with-soxr --with-avahi --with-ssl=openssl --with-systemd --with-airplay-2
     make -j $(nproc)
     # Explicitly set systemd unit directories for Debian
     sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user
