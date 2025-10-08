@@ -13,7 +13,7 @@ cleanup() {
 }
 
 verify_os() {
-    MSG="Unsupported OS: Raspberry Pi OS 12 (bookworm) is required."
+    MSG="Unsupported OS: Debian 12/13 is required."
 
     if [ ! -f /etc/os-release ]; then
         echo $MSG
@@ -22,7 +22,8 @@ verify_os() {
 
     . /etc/os-release
 
-    if [[ ("$ID" != "debian" && "$ID" != "raspbian") || "$VERSION_ID" != "12" ]]; then
+    # Accept Debian / Raspbian 12 (bookworm) and 13 (trixie)
+    if [[ ("$ID" != "debian" && "$ID" != "raspbian") || ("$VERSION_ID" != "12" && "$VERSION_ID" != "13") ]]; then
         echo $MSG
         exit 1
     fi
@@ -32,10 +33,13 @@ set_hostname() {
     CURRENT_PRETTY_HOSTNAME=$(hostnamectl status --pretty)
 
     read -p "Hostname [$(hostname)]: " HOSTNAME
-    sudo raspi-config nonint do_hostname ${HOSTNAME:-$(hostname)}
+    # Use hostnamectl on generic Debian instead of raspi-config
+    if [[ -n "${HOSTNAME}" ]]; then
+        sudo hostnamectl set-hostname "${HOSTNAME}"
+    fi
 
-    read -p "Pretty hostname [${CURRENT_PRETTY_HOSTNAME:-Raspberry Pi}]: " PRETTY_HOSTNAME
-    PRETTY_HOSTNAME="${PRETTY_HOSTNAME:-${CURRENT_PRETTY_HOSTNAME:-Raspberry Pi}}"
+    read -p "Pretty hostname [${CURRENT_PRETTY_HOSTNAME:-Audio Receiver}]: " PRETTY_HOSTNAME
+    PRETTY_HOSTNAME="${PRETTY_HOSTNAME:-${CURRENT_PRETTY_HOSTNAME:-Audio Receiver}}"
     sudo hostnamectl set-hostname --pretty "$PRETTY_HOSTNAME"
 }
 
@@ -43,9 +47,9 @@ install_bluetooth() {
     read -p "Do you want to install Bluetooth Audio (ALSA)? [y/N] " REPLY
     if [[ ! "$REPLY" =~ ^(yes|y|Y)$ ]]; then return; fi
 
-    # Bluetooth Audio ALSA Backend (bluez-alsa-utils)
+    # Bluetooth stack and BlueALSA backend (avoid recommends for lean install)
     sudo apt update
-    sudo apt install -y --no-install-recommends bluez-tools bluez-alsa-utils
+    sudo apt install -y --no-install-recommends bluez bluez-tools bluez-alsa-utils
 
     # Bluetooth settings
     sudo tee /etc/bluetooth/main.conf >/dev/null <<'EOF'
@@ -65,9 +69,10 @@ Requires=bluetooth.service
 After=bluetooth.service
 
 [Service]
-ExecStartPre=/usr/bin/bluetoothctl discoverable on
-ExecStartPre=/bin/hciconfig %I piscan
-ExecStartPre=/bin/hciconfig %I sspmode 1
+# Ensure adapter is ready for pairing and discoverable without relying on deprecated hciconfig
+ExecStartPre=/usr/bin/bluetoothctl --timeout 30 power on
+ExecStartPre=/usr/bin/bluetoothctl --timeout 30 pairable on
+ExecStartPre=/usr/bin/bluetoothctl --timeout 30 discoverable on
 ExecStart=/usr/bin/bt-agent --capability=NoInputNoOutput
 RestartSec=5
 Restart=always
@@ -111,7 +116,8 @@ install_shairport() {
     if [[ ! "$REPLY" =~ ^(yes|y|Y)$ ]]; then return; fi
 
     sudo apt update
-    sudo apt install -y --no-install-recommends wget unzip autoconf automake build-essential libtool git autoconf automake libpopt-dev libconfig-dev libasound2-dev avahi-daemon libavahi-client-dev libssl-dev libsoxr-dev libplist-dev libsodium-dev libavutil-dev libavcodec-dev libavformat-dev uuid-dev libgcrypt20-dev xxd
+    # Add pkg-config and libsystemd-dev so systemd unit dirs are detected during install
+    sudo apt install -y --no-install-recommends wget unzip autoconf automake build-essential libtool git pkg-config libsystemd-dev libpopt-dev libconfig-dev libasound2-dev avahi-daemon libavahi-client-dev libssl-dev libsoxr-dev libplist-dev libsodium-dev libavutil-dev libavcodec-dev libavformat-dev uuid-dev libgcrypt20-dev xxd
 
     if [[ -z "$TMP_DIR" ]]; then
         TMP_DIR=$(mktemp -d)
@@ -138,7 +144,8 @@ install_shairport() {
     autoreconf -fi
     ./configure --with-systemd-startup
     make -j $(nproc)
-    sudo make install
+    # Explicitly set systemd unit directories for Debian
+    sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user
     cd ..
     rm -rf nqptp-${NQPTP_VERSION}
 
@@ -149,7 +156,8 @@ install_shairport() {
     autoreconf -fi
     ./configure --sysconfdir=/etc --with-alsa --with-soxr --with-avahi --with-ssl=openssl --with-systemd --with-airplay-2 --with-apple-alac
     make -j $(nproc)
-    sudo make install
+    # Explicitly set systemd unit directories for Debian
+    sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user
     cd ..
     rm -rf shairport-sync-${SHAIRPORT_SYNC_VERSION}
 
@@ -165,7 +173,10 @@ sessioncontrol = {
 };
 EOF
 
-    sudo usermod -a -G gpio shairport-sync
+    # Add gpio group only if it exists (Raspberry Pi specific)
+    if getent group gpio >/dev/null; then
+        sudo usermod -a -G gpio shairport-sync
+    fi
     sudo systemctl enable --now nqptp
     sudo systemctl enable --now shairport-sync
 }
@@ -175,6 +186,7 @@ install_raspotify() {
     if [[ ! "$REPLY" =~ ^(yes|y|Y)$ ]]; then return; fi
 
     # Install Raspotify
+    sudo apt update && sudo apt install -y --no-install-recommends curl
     curl -sL https://dtcooper.github.io/raspotify/install.sh | sh
 
     # Configure Raspotify
