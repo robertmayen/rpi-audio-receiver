@@ -143,33 +143,42 @@ set -euo pipefail
 CONF="/etc/shairport-sync.conf"
 
 pick_default() {
-  # Prefer HDMI if a monitor is connected; else analog/default
-  local chosen="default"
+  # Prefer HDMI with resampling via plughw if a monitor is connected; else default or first plughw
+  local hdmi_connected=0
   if ls /proc/asound/card*/eld#* &>/dev/null; then
-    # Map common HDA HDMI indices to ALSA hdmi DEV numbers 0..3
-    # For card N, ELD index K typically corresponds to hdmi DEV=K
-    local card_index=0
     while read -r path; do
-      if grep -qs "monitor_present *1" "$path"; then
-        # Extract ELD index (e.g., eld#0.1 -> 1)
-        idx=$(basename "$path" | awk -F'.' '{print $2}')
-        # Determine CARD name for this card index from aplay -L
-        card_name=$(aplay -L 2>/dev/null | awk -v ci="$card_index" '/^hdmi:CARD=/{print $1}' | sed -n "$(($idx+1))p" | sed -E 's/^hdmi:CARD=([^,]+).*/\1/')
-        if [[ -n "${card_name:-}" ]]; then
-          echo "hdmi:CARD=${card_name},DEV=${idx}"
-          return 0
-        fi
+      if grep -qs "monitor_present *1" "$path"; then hdmi_connected=1; break; fi
+    done < <(ls /proc/asound/card*/eld#* 2>/dev/null)
+  fi
+
+  if [[ $hdmi_connected -eq 1 ]]; then
+    # Build candidate list of HDMI PCM devices from aplay -l and pick the first
+    while read -r line; do
+      cardname=$(awk '{print $3}' <<<"$line" | sed 's/://')
+      devnum=$(awk '{print $6}' <<<"$line" | sed 's/://')
+      if [[ -n "${cardname}" && -n "${devnum}" ]]; then
+        echo "plughw:CARD=${cardname},DEV=${devnum}"
+        return 0
       fi
-      card_index=$((card_index+1))
-    done < <(ls /proc/asound/card*/eld#* 2>/dev/null | sort)
+    done < <(aplay -l 2>/dev/null | awk '/^card .* device .*HDMI/ {print}')
   fi
-  # Fall back to system default or first plughw device
-  if aplay -L 2>/dev/null | grep -qx "default"; then
-    echo "default"
-  else
-    dev=$(aplay -L 2>/dev/null | awk '/^plughw:|^hw:/{print $1; exit}')
-    echo "${dev:-default}"
+
+  # Fall back to ALSA default of the primary card
+  def=$(aplay -L 2>/dev/null | awk -F: '/^default:/ {print $1":"$2; exit}')
+  if [[ -n "${def}" ]]; then
+    echo "${def}"
+    return 0
   fi
+
+  # Finally, pick the first plughw device
+  dev=$(aplay -L 2>/dev/null | awk '/^plughw:/{print $1; exit}')
+  if [[ -n "${dev}" ]]; then
+    echo "${dev}"
+    return 0
+  fi
+
+  # As an absolute last resort
+  echo "default"
 }
 
 DEVICE=$(pick_default)
