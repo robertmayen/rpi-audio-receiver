@@ -2,6 +2,8 @@
 
 A simple, light weight audio receiver with Bluetooth (A2DP), AirPlay 2, and Spotify Connect.
 
+> Also works on Debian 12/13 (Bookworm/Trixie) on x86_64 systems (e.g., Wyse 5070) using the included `install.sh`. See “Debian 12/13 Notes”.
+
 ## Features
 
 Devices like phones, tablets and computers can play audio via this receiver.
@@ -9,7 +11,7 @@ Devices like phones, tablets and computers can play audio via this receiver.
 ## Requirements
 
 - A USB Bluetooth dongle (the internal Raspberry Pi Bluetooth chipset turned out as not suited for audio playback and causes all kinds of strange connectivity problems)
-- Raspberry Pi OS 12 Lite
+- Raspberry Pi OS 12 Lite, or Debian 12/13 CLI
 - Internal audio, HDMI, USB or I2S Audio adapter (tested with [Adafruit USB Audio Adapter](https://www.adafruit.com/product/1475),  [pHAT DAC](https://shop.pimoroni.de/products/phat-dac), and [HifiBerry DAC+](https://www.hifiberry.com/products/dacplus/))
 
 **Again: do not try to use the internal Bluetooth chip, this will only bring you many hours of frustration.**
@@ -22,6 +24,29 @@ The installation script asks whether to install each component.
     bash install.sh
 
 **Note**: the installation process is not reversible, there is no uninstall. The script is meant to be run on a clean device that is not used for anything else.
+
+## Debian 12/13 Notes
+
+- Supported: Debian Bookworm/Trixie, CLI-only systems. The installer will:
+  - Build and enable NQPTP for AirPlay 2 timing.
+  - Build and install Shairport Sync (currently 4.3.7) with AirPlay 2 enabled to avoid FFmpeg 7 segfaults in older builds.
+  - Install a native systemd unit at `/etc/systemd/system/shairport-sync.service` that runs a pre-start script to auto-pick an ALSA output device.
+  - Auto-detect output: prefers HDMI if a monitor is connected, otherwise analog/default. Sets `alsa.output_device` and `alsa.output_rate = 48000` in `/etc/shairport-sync.conf` to satisfy common HDA/HDMI hardware that rejects 44.1 kHz.
+  - Add udev rules to restart Shairport on HDMI and sound device hotplug so the output is reselected automatically.
+  - Use `hostnamectl` instead of `raspi-config` for host naming.
+
+- Paths and differences on Debian:
+  - Shairport binary: `/usr/local/bin/shairport-sync` (service uses this). Config: `/etc/shairport-sync.conf`.
+  - NQPTP binary: `/usr/local/bin/nqptp`. Unit: `/usr/local/lib/systemd/system/nqptp.service`.
+  - Bluetooth daemon path for A2DP volume override is `/usr/lib/bluetooth/bluetoothd` (not `/usr/libexec/...`).
+  - No Raspberry Pi overlays or `/boot/firmware/config.txt` tweaks are needed/used.
+
+- Optional: If you prefer the Debian packaged Shairport (`apt install shairport-sync`) note it may not include AirPlay 2. The installer builds from source when AirPlay 2 is desired.
+
+- Troubleshooting audio on Debian:
+  - List devices: `aplay -l` and `aplay -L`.
+  - If you see: “fatal error: The output DAC can not be set to 44100 fps”, ensure the device is `default:` or `plughw:` and that `output_rate = 48000` is present in the `alsa` block.
+  - Use `alsamixer` to unmute and raise volumes; test with `speaker-test`.
 
 ### Basic setup
 

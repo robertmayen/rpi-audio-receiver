@@ -3,7 +3,8 @@
 set -e
 
 NQPTP_VERSION="1.2.4"
-SHAIRPORT_SYNC_VERSION="4.3.2"
+# Build Shairport Sync with AirPlay 2 support; use a version compatible with FFmpeg 7
+SHAIRPORT_SYNC_VERSION="4.3.7"
 TMP_DIR=""
 
 cleanup() {
@@ -49,7 +50,16 @@ install_bluetooth() {
 
     # Bluetooth stack and BlueALSA backend (avoid recommends for lean install)
     sudo apt update
-    sudo apt install -y --no-install-recommends bluez bluez-tools bluez-alsa-utils
+    # Pick BlueALSA package names that exist on this Debian
+    PKGS=(bluez bluez-tools)
+    if apt-cache show bluez-alsa-utils >/dev/null 2>&1; then
+      PKGS+=(bluez-alsa-utils)
+    else
+      # Debian typically ships bluealsa / bluealsa-utils
+      if apt-cache show bluealsa >/dev/null 2>&1; then PKGS+=(bluealsa); fi
+      if apt-cache show bluealsa-utils >/dev/null 2>&1; then PKGS+=(bluealsa-utils); fi
+    fi
+    sudo apt install -y --no-install-recommends "${PKGS[@]}"
 
     # Bluetooth settings
     sudo tee /etc/bluetooth/main.conf >/dev/null <<'EOF'
@@ -117,7 +127,7 @@ install_shairport() {
 
     # Base tools and services
     sudo apt update
-    sudo apt install -y --no-install-recommends avahi-daemon alsa-utils
+    sudo apt install -y --no-install-recommends avahi-daemon alsa-utils wget unzip autoconf automake build-essential libtool git pkg-config libsystemd-dev libpopt-dev libconfig-dev libasound2-dev libavahi-client-dev libssl-dev libsoxr-dev libplist-dev libsodium-dev libavutil-dev libavcodec-dev libavformat-dev uuid-dev libgcrypt20-dev xxd
 
     # Build and install NQPTP for AirPlay 2 timing (packaged shairport-sync can use it)
     if [[ -z "$TMP_DIR" ]]; then
@@ -130,15 +140,24 @@ install_shairport() {
       autoreconf -fi && \
       ./configure --with-systemd-startup && \
       make -j $(nproc) && \
-      sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user )
+      sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user ) || true
+    # In case upstream install tried to enable/start a default unit, disable it before we install our own
+    sudo systemctl disable --now shairport-sync >/dev/null 2>&1 || true
 
-    # Prefer packaged Shairport on Debian 12/13 to avoid FFmpeg-7 segfaults on source builds
-    sudo apt install -y --no-install-recommends shairport-sync
+    # Build Shairport Sync from source with AirPlay 2 enabled
+    ( cd "$TMP_DIR" && \
+      wget -O shairport-sync-${SHAIRPORT_SYNC_VERSION}.zip https://github.com/mikebrady/shairport-sync/archive/refs/tags/${SHAIRPORT_SYNC_VERSION}.zip && \
+      unzip -q shairport-sync-${SHAIRPORT_SYNC_VERSION}.zip && \
+      cd shairport-sync-${SHAIRPORT_SYNC_VERSION} && \
+      autoreconf -fi && \
+      ./configure --sysconfdir=/etc --with-alsa --with-soxr --with-avahi --with-ssl=openssl --with-systemd --with-airplay-2 && \
+      make -j $(nproc) && \
+      sudo make install systemdsystemunitdir=/lib/systemd/system systemduserunitdir=/usr/lib/systemd/user )
 
     # Create a native systemd unit that runs before playback to pick the best ALSA device
     sudo tee /usr/local/bin/shairport-output-detect >/dev/null <<'EOF'
 #!/bin/bash
-set -euo pipefail
+set -u
 
 CONF="/etc/shairport-sync.conf"
 
@@ -160,18 +179,18 @@ pick_default() {
         echo "plughw:CARD=${cardname},DEV=${devnum}"
         return 0
       fi
-    done < <(aplay -l 2>/dev/null | awk '/^card .* device .*HDMI/ {print}')
+    done < <(aplay -l 2>/dev/null || true | awk '/^card .* device .*HDMI/ {print}')
   fi
 
   # Fall back to ALSA default of the primary card
-  def=$(aplay -L 2>/dev/null | awk -F: '/^default:/ {print $1":"$2; exit}')
+  def=$(aplay -L 2>/dev/null || true | awk -F: '/^default:/ {print $1":"$2; exit}')
   if [[ -n "${def}" ]]; then
     echo "${def}"
     return 0
   fi
 
   # Finally, pick the first plughw device
-  dev=$(aplay -L 2>/dev/null | awk '/^plughw:/{print $1; exit}')
+  dev=$(aplay -L 2>/dev/null || true | awk '/^plughw:/{print $1; exit}')
   if [[ -n "${dev}" ]]; then
     echo "${dev}"
     return 0
@@ -181,33 +200,41 @@ pick_default() {
   echo "default"
 }
 
-DEVICE=$(pick_default)
+# Wait briefly for ALSA cards to appear on boot
+for i in $(seq 1 10); do
+  if aplay -l >/dev/null 2>&1; then break; fi
+  sleep 0.5
+done
 
-# Ensure config exists and set ALSA device
-if [[ ! -f "$CONF" ]]; then
-  echo "general = { name = \"$(hostname)\"; output_backend = \"alsa\"; };" > "$CONF"
-fi
+    DEVICE=$(pick_default)
 
-# If an alsa block exists, update or insert output_device; otherwise add a new block
-if grep -qE '^alsa *= *\{' "$CONF"; then
-  if grep -qE '^[[:space:]]*output_device[[:space:]]*=' "$CONF"; then
-    sed -i -E "s#(^[[:space:]]*output_device[[:space:]]*=).*#\1 \"${DEVICE}\";#" "$CONF"
-  else
-    # Insert before closing brace of the alsa block
-    awk -v dev="$DEVICE" '
-      BEGIN{ins=0}
-      /^alsa[[:space:]]*=.*\{/ {print; ins=1; next}
-      ins==1 && /^\}/ {print "  output_device = \"" dev "\";"; ins=0}
-      {print}
-    ' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
-  fi
-else
-  cat <<EOC >> "$CONF"
-alsa = {
-  output_device = "${DEVICE}";
-};
-EOC
-fi
+    # Ensure config exists and set ALSA device
+    if [[ ! -f "$CONF" ]]; then
+      echo "general = { name = \"$(hostname)\"; output_backend = \"alsa\"; };" > "$CONF"
+    fi
+
+    # Ensure ALSA block exists and set output_device and output_rate using awk (sed-safe)
+    if grep -qE '^alsa *= *\{' "$CONF"; then
+      awk -v dev="$DEVICE" '
+        BEGIN{in_alsa=0; outdev=0; outrate=0}
+        /^alsa[[:space:]]*=.*\{/ {print; in_alsa=1; next}
+        in_alsa==1 && /^[[:space:]]*output_device[[:space:]]*=/ {print "  output_device = \"" dev "\";"; outdev=1; next}
+        in_alsa==1 && /^[[:space:]]*output_rate[[:space:]]*=/ {print "  output_rate = 48000;"; outrate=1; next}
+        in_alsa==1 && /^\}/ {
+          if (outdev==0) print "  output_device = \"" dev "\";";
+          if (outrate==0) print "  output_rate = 48000;";
+          print; in_alsa=0; outdev=0; outrate=0; next
+        }
+        {print}
+      ' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+    else
+      cat <<EOC >> "$CONF"
+    alsa = {
+      output_device = "${DEVICE}";
+      output_rate = 48000;
+    };
+    EOC
+    fi
 EOF
     sudo chmod +x /usr/local/bin/shairport-output-detect
 
@@ -227,8 +254,8 @@ EOF
     sudo tee /etc/systemd/system/shairport-sync.service >/dev/null <<'EOF'
 [Unit]
 Description=Shairport Sync - AirPlay Audio Receiver
-After=network-online.target sound.target
-Wants=network-online.target
+After=network-online.target avahi-daemon.service sound.target alsa-restore.service
+Wants=network-online.target avahi-daemon.service
 
 [Service]
 User=shairport-sync
@@ -236,8 +263,9 @@ Group=shairport-sync
 SupplementaryGroups=audio
 PermissionsStartOnly=true
 ExecStartPre=/usr/local/bin/shairport-output-detect
-ExecStart=/usr/bin/shairport-sync -c /etc/shairport-sync.conf
+ExecStart=/usr/local/bin/shairport-sync -c /etc/shairport-sync.conf
 Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
