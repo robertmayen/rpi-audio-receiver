@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Raspberry Pi Audio Receiver - Production Installation Script
+# Dell Wyse - Production Installation Script
 # Features: State management, rollback, validation, idempotency
 
 set -euo pipefail
@@ -924,7 +924,7 @@ TimeoutStopSec=10
 WantedBy=multi-user.target
 EOF
     
-    # Add gpio group if it exists (Raspberry Pi)
+    # Add gpio group if it exists (Dell Wyse)
     if getent group gpio &>/dev/null && getent passwd shairport-sync &>/dev/null; then
         usermod -a -G gpio shairport-sync 2>/dev/null || true
     fi
@@ -1241,6 +1241,67 @@ show_summary() {
     echo "═══════════════════════════════════════════════════════════"
 }
 
+run_diagnostics() {
+    echo
+    echo "═══════════════════════════════════════════════════════════"
+    echo "Diagnostic Checks"
+    echo "═══════════════════════════════════════════════════════════"
+    
+    local file_hostname runtime_hostname pretty_hostname hosts_entry
+    file_hostname=$(cat /etc/hostname 2>/dev/null || echo "unknown")
+    runtime_hostname=$(hostname 2>/dev/null || echo "unknown")
+    pretty_hostname=$(hostnamectl status --pretty 2>/dev/null || echo "unknown")
+    hosts_entry=$(grep -E '^127\.0\.1\.1' /etc/hosts 2>/dev/null || echo "MISSING 127.0.1.1 entry")
+    
+    echo "System hostname file: ${file_hostname}"
+    echo "Runtime hostname:      ${runtime_hostname}"
+    echo "Pretty hostname:       ${pretty_hostname}"
+    echo "127.0.1.1 entry:       ${hosts_entry}"
+    
+    if [[ "$file_hostname" != "$runtime_hostname" ]]; then
+        warn "Runtime hostname differs from /etc/hostname"
+    fi
+    
+    if [[ "$hosts_entry" == "MISSING 127.0.1.1 entry" ]]; then
+        warn "/etc/hosts lacks a 127.0.1.1 mapping for your hostname"
+    elif [[ "$hosts_entry" != *"$runtime_hostname"* ]]; then
+        warn "/etc/hosts entry does not reference hostname '$runtime_hostname'"
+    fi
+    
+    local state_pretty
+    state_pretty=$(get_state "hostname_pretty" "")
+    if [[ -n "$state_pretty" && "$state_pretty" != "null" ]]; then
+        echo "Installer stored pretty hostname: ${state_pretty}"
+        if [[ "$state_pretty" != "$pretty_hostname" ]]; then
+            warn "Pretty hostname stored in installer state differs from hostnamectl"
+        fi
+    fi
+    
+    if systemctl list-unit-files | grep -q '^avahi-daemon'; then
+        if systemctl is-active --quiet avahi-daemon; then
+            info "avahi-daemon is running"
+        else
+            warn "avahi-daemon is not active; AirPlay discovery will fail"
+        fi
+    else
+        warn "avahi-daemon not installed; install avahi-daemon and avahi-utils for AirPlay discovery"
+    fi
+    
+    if command -v avahi-browse &>/dev/null; then
+        echo
+        echo "Recent RAOP (_raop._tcp) advertisements:"
+        if command -v timeout &>/dev/null; then
+            timeout 5 avahi-browse -rt _raop._tcp 2>/dev/null | head -n 20 || true
+        else
+            avahi-browse -rt _raop._tcp 2>/dev/null | head -n 20 || true
+        fi
+    else
+        warn "avahi-utils not installed; install it to inspect advertised AirPlay services (apt install avahi-utils)"
+    fi
+    
+    echo "═══════════════════════════════════════════════════════════"
+}
+
 main() {
     show_banner
     
@@ -1268,6 +1329,7 @@ main() {
     
     # Summary
     show_summary
+    run_diagnostics
     
     success "Installation completed successfully!"
 }
