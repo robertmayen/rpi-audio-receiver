@@ -57,6 +57,48 @@ ensure_state_dir() {
     fi
 }
 
+service_exists() {
+    local unit=$1
+    systemctl list-unit-files "$unit" 2>/dev/null | grep -Fq "$unit"
+}
+
+ensure_hosts_mapping() {
+    local hostname=$1
+    
+    [[ -z "$hostname" ]] && return 0
+    
+    if [[ ! -f /etc/hosts ]]; then
+        echo "127.0.1.1   ${hostname}" > /etc/hosts
+        return 0
+    fi
+    
+    if grep -q '^127\.0\.1\.1' /etc/hosts; then
+        if ! grep -q "^127\.0\.1\.1[[:space:]]\+${hostname}\\b" /etc/hosts; then
+            backup_file "/etc/hosts"
+            sed -i "s/^127\.0\.1\.1.*/127.0.1.1   ${hostname}/" /etc/hosts
+        fi
+    else
+        backup_file "/etc/hosts"
+        echo "127.0.1.1   ${hostname}" >> /etc/hosts
+    fi
+}
+
+restart_avahi_if_present() {
+    if service_exists "avahi-daemon.service"; then
+        info "Restarting avahi-daemon to apply hostname changes..."
+        if ! systemctl restart avahi-daemon; then
+            warn "Failed to restart avahi-daemon"
+        fi
+    fi
+}
+
+restart_shairport_if_present() {
+    if service_exists "shairport-sync.service"; then
+        info "Restarting shairport-sync to refresh mDNS registration..."
+        systemctl restart shairport-sync 2>/dev/null || warn "Failed to restart shairport-sync"
+    fi
+}
+
 get_state() {
     local key=$1
     local default=${2:-null}
@@ -223,8 +265,17 @@ configure_hostname() {
     
     if [[ "$new_hostname" != "$current_hostname" ]]; then
         backup_file "/etc/hostname"
-        backup_file "/etc/hosts"
         hostnamectl set-hostname "$new_hostname" || die "Failed to set hostname"
+    fi
+    
+    ensure_hosts_mapping "$new_hostname"
+    
+    if [[ "$new_hostname" != "$current_hostname" ]]; then
+        if service_exists "shairport-sync.service"; then
+            systemctl stop shairport-sync 2>/dev/null || true
+        fi
+        restart_avahi_if_present
+        restart_shairport_if_present
     fi
     
     hostnamectl set-hostname --pretty "$new_pretty" || die "Failed to set pretty hostname"
@@ -1277,7 +1328,7 @@ run_diagnostics() {
         fi
     fi
     
-    if systemctl list-unit-files | grep -q '^avahi-daemon'; then
+    if service_exists "avahi-daemon.service"; then
         if systemctl is-active --quiet avahi-daemon; then
             info "avahi-daemon is running"
         else
