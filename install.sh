@@ -450,9 +450,15 @@ create_output_detect_script() {
 #!/bin/bash
 # Shairport Sync Audio Output Detection Script
 # This script runs before shairport-sync starts to select the best audio device
+# Includes cold-start handling for USB DACs and HDMI audio
 
 CONF="/etc/shairport-sync.conf"
 LOG_TAG="shairport-output-detect"
+
+# Cold start configuration
+USB_WAIT_TIMEOUT=${USB_WAIT_TIMEOUT:-30}      # Max seconds to wait for USB audio
+ALSA_WAIT_TIMEOUT=${ALSA_WAIT_TIMEOUT:-15}    # Max seconds to wait for any ALSA
+HDMI_WAIT_TIMEOUT=${HDMI_WAIT_TIMEOUT:-10}    # Max seconds to wait for HDMI
 
 # Logging function
 log() { 
@@ -652,20 +658,116 @@ detect_best_device() {
     log "Using absolute fallback: default"
 }
 
-# Main execution
-main() {
-    # Wait for ALSA to be ready (max 10 seconds)
-    for i in {1..20}; do
+# Wait for ALSA subsystem to be ready
+wait_for_alsa() {
+    local max_attempts=$((ALSA_WAIT_TIMEOUT * 2))  # 0.5s intervals
+    local i
+    
+    log "Waiting for ALSA subsystem (max ${ALSA_WAIT_TIMEOUT}s)..."
+    
+    for ((i=1; i<=max_attempts; i++)); do
         if aplay -l &>/dev/null 2>&1; then 
-            log "ALSA ready after ${i} attempts"
-            break
+            log "ALSA ready after $((i/2))s"
+            return 0
         fi
         sleep 0.5
     done
     
-    # Detect device
-    local DEVICE=$(detect_best_device)
-    DEVICE=$(echo "$DEVICE" | tr -d '\r\n' | awk '{print $1}')
+    log "ALSA not ready after ${ALSA_WAIT_TIMEOUT}s, continuing anyway..."
+    return 1
+}
+
+# Wait specifically for USB audio devices (cold start handling)
+wait_for_usb_audio() {
+    local max_attempts=$((USB_WAIT_TIMEOUT * 2))  # 0.5s intervals
+    local i
+    local usb_dev
+    
+    log "Waiting for USB audio device (max ${USB_WAIT_TIMEOUT}s)..."
+    
+    for ((i=1; i<=max_attempts; i++)); do
+        if usb_dev=$(find_usb_device 2>/dev/null) && [[ -n "$usb_dev" ]]; then
+            log "USB audio found after $((i/2))s: $usb_dev"
+            echo "$usb_dev"
+            return 0
+        fi
+        
+        # Also try aplay method
+        if usb_dev=$(find_usb_device_from_aplay 2>/dev/null) && [[ -n "$usb_dev" ]]; then
+            log "USB audio found (aplay) after $((i/2))s: $usb_dev"
+            echo "$usb_dev"
+            return 0
+        fi
+        
+        sleep 0.5
+    done
+    
+    log "No USB audio found after ${USB_WAIT_TIMEOUT}s"
+    return 1
+}
+
+# Wait for HDMI audio with active monitor
+wait_for_hdmi_audio() {
+    local max_attempts=$((HDMI_WAIT_TIMEOUT * 2))  # 0.5s intervals
+    local i
+    
+    log "Checking for HDMI audio (max ${HDMI_WAIT_TIMEOUT}s)..."
+    
+    for ((i=1; i<=max_attempts; i++)); do
+        if ls /proc/asound/card*/eld#* &>/dev/null 2>&1; then
+            while IFS= read -r eld_file; do
+                if grep -qs "monitor_present *1" "$eld_file" 2>/dev/null; then
+                    # Find first HDMI device
+                    while IFS= read -r line; do
+                        local card_id=$(echo "$line" | awk '{print $2}' | tr -d ':')
+                        local dev_id=$(echo "$line" | awk '{print $4}' | tr -d ':')
+                        
+                        if [[ -n "$card_id" && -n "$dev_id" ]]; then
+                            log "HDMI audio found after $((i/2))s: plughw:${card_id},${dev_id}"
+                            echo "plughw:${card_id},${dev_id}"
+                            return 0
+                        fi
+                    done < <(aplay -l 2>/dev/null | grep "^card.*HDMI" || true)
+                fi
+            done < <(ls /proc/asound/card*/eld#* 2>/dev/null || true)
+        fi
+        sleep 0.5
+    done
+    
+    log "No active HDMI audio found after ${HDMI_WAIT_TIMEOUT}s"
+    return 1
+}
+
+# Main execution
+main() {
+    log "=== Shairport Output Detection Starting ==="
+    log "Cold start timeouts: ALSA=${ALSA_WAIT_TIMEOUT}s, USB=${USB_WAIT_TIMEOUT}s, HDMI=${HDMI_WAIT_TIMEOUT}s"
+    
+    # Phase 1: Wait for ALSA subsystem
+    wait_for_alsa || true
+    
+    # Phase 2: Try to find USB audio first (with extended wait for cold start)
+    local DEVICE=""
+    if DEVICE=$(wait_for_usb_audio); then
+        DEVICE=$(echo "$DEVICE" | head -n1 | tr -d '\r\n' | awk '{print $1}')
+        log "Using USB audio device: $DEVICE"
+    # Phase 3: Try HDMI if no USB found
+    elif DEVICE=$(wait_for_hdmi_audio); then
+        DEVICE=$(echo "$DEVICE" | head -n1 | tr -d '\r\n' | awk '{print $1}')
+        log "Using HDMI audio device: $DEVICE"
+    # Phase 4: Fall back to detect_best_device for other options
+    else
+        log "No USB or HDMI found, using fallback detection..."
+        DEVICE=$(detect_best_device)
+        DEVICE=$(echo "$DEVICE" | tr -d '\r\n' | awk '{print $1}')
+    fi
+    
+    # Legacy fallback - detect device if still empty
+    if [[ -z "$DEVICE" ]]; then
+        log "Device still empty, running legacy detection..."
+        DEVICE=$(detect_best_device)
+        DEVICE=$(echo "$DEVICE" | tr -d '\r\n' | awk '{print $1}')
+    fi
     
     # Validate device name
     case "$DEVICE" in
@@ -787,20 +889,36 @@ create_shairport_service() {
     cat > /etc/systemd/system/shairport-sync.service <<'EOF'
 [Unit]
 Description=Shairport Sync - AirPlay Audio Receiver
-After=network-online.target avahi-daemon.service sound.target alsa-restore.service
+# Cold start dependencies - wait for hardware to be ready
+After=network-online.target avahi-daemon.service sound.target alsa-restore.service local-fs.target
+After=systemd-udev-settle.service
 Wants=network-online.target avahi-daemon.service
+# Ensure we start after USB devices are enumerated
+After=sys-subsystem-sound-devices-card0.device
+Wants=sys-subsystem-sound-devices-card0.device
 
 [Service]
+Type=simple
 User=shairport-sync
 Group=shairport-sync
 SupplementaryGroups=audio
 PermissionsStartOnly=true
 RuntimeDirectory=shairport-sync
 RuntimeDirectoryMode=0755
+
+# Cold start handling - output detection script waits for audio devices
 ExecStartPre=/usr/local/bin/shairport-output-detect
 ExecStart=/usr/local/bin/shairport-sync -c /etc/shairport-sync.conf
+
+# Robust restart policy for cold start failures
 Restart=on-failure
-RestartSec=2
+RestartSec=3
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Watchdog for hung processes
+TimeoutStartSec=90
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -818,18 +936,58 @@ EOF
 install_shairport_udev() {
     info "Installing Shairport Sync udev rules..."
     
+    # Create debounced restart script to handle rapid udev events
     cat > /usr/local/bin/shairport-udev-restart <<'EOF'
-#!/bin/sh
-/usr/bin/systemctl try-restart shairport-sync.service
+#!/bin/bash
+# Debounced restart for shairport-sync on audio device changes
+# Prevents rapid restarts during USB enumeration
+
+LOCK_FILE="/tmp/shairport-restart.lock"
+DEBOUNCE_SECONDS=3
+
+# Use flock to prevent concurrent executions
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    # Another instance is running, exit silently
+    exit 0
+fi
+
+# Log the trigger
+logger -t "shairport-udev" "Audio device change detected, scheduling restart..."
+
+# Wait for debounce period (allows USB to fully enumerate)
+sleep "$DEBOUNCE_SECONDS"
+
+# Restart the service
+if systemctl is-active --quiet shairport-sync; then
+    logger -t "shairport-udev" "Restarting shairport-sync service..."
+    /usr/bin/systemctl restart shairport-sync.service
+else
+    logger -t "shairport-udev" "Starting shairport-sync service..."
+    /usr/bin/systemctl start shairport-sync.service
+fi
+
+# Release lock
+flock -u 200
 EOF
     
     chmod 755 /usr/local/bin/shairport-udev-restart || die "Failed to set permissions"
     
     cat > /etc/udev/rules.d/99-shairport-hotplug.rules <<'EOF'
-# Restart Shairport when displays are connected/disconnected
+# Shairport Sync Audio Hotplug Rules
+# These rules handle cold start and hot-plug scenarios for audio devices
+
+# Restart Shairport when displays are connected/disconnected (HDMI audio)
 ACTION=="change", SUBSYSTEM=="drm", ENV{HOTPLUG}=="1", RUN+="/usr/local/bin/shairport-udev-restart"
-# Restart Shairport when ALSA cards change
+
+# Restart Shairport when ALSA sound cards are added (USB DAC plug-in)
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="card*", RUN+="/usr/local/bin/shairport-udev-restart"
+
+# Restart Shairport when ALSA sound cards change
 ACTION=="change", SUBSYSTEM=="sound", KERNEL=="card*", RUN+="/usr/local/bin/shairport-udev-restart"
+
+# Handle USB audio device addition specifically
+ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="01", RUN+="/usr/local/bin/shairport-udev-restart"
 EOF
     
     udevadm control --reload || warn "Failed to reload udev rules"
