@@ -896,6 +896,8 @@ Wants=network-online.target avahi-daemon.service
 # Ensure we start after USB devices are enumerated
 After=sys-subsystem-sound-devices-card0.device
 Wants=sys-subsystem-sound-devices-card0.device
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -913,8 +915,6 @@ ExecStart=/usr/local/bin/shairport-sync -c /etc/shairport-sync.conf
 # Robust restart policy for cold start failures
 Restart=on-failure
 RestartSec=3
-StartLimitIntervalSec=120
-StartLimitBurst=5
 
 # Watchdog for hung processes
 TimeoutStartSec=90
